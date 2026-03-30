@@ -7,6 +7,8 @@ import time
 import re
 import json
 import warnings
+import wave
+import numpy as np
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -62,6 +64,10 @@ LANG_CHOICES = [
 
 SPEAKER_LABELS = [label for label, _ in SPEAKER_CHOICES]
 SPEAKER_ID_BY_LABEL = {label: sid for label, sid in SPEAKER_CHOICES}
+
+# Character profile "Base Speaker" dropdown: explicit none so optional field can be cleared
+BASE_SPEAKER_NONE = "(none)"
+BASE_SPEAKER_DROPDOWN_CHOICES = [BASE_SPEAKER_NONE] + SPEAKER_LABELS
 
 
 def _speaker_id_from_ui(value: str) -> str:
@@ -165,7 +171,7 @@ def get_characters() -> list:
     return sorted(f[:-5] for f in os.listdir(path) if f.endswith(".json"))
 
 
-def save_character(name: str, description: str, base_speaker: str = "vivian", notes: str = "") -> tuple:
+def save_character(name: str, description: str, base_speaker: str, notes: str = "") -> tuple:
     """Save a character profile with voice description."""
     if not name or not name.strip():
         return "Enter a character name first.", gr.update()
@@ -178,11 +184,17 @@ def save_character(name: str, description: str, base_speaker: str = "vivian", no
     
     path = _preset_path("characters")
     os.makedirs(path, exist_ok=True)
+
+    bs = (base_speaker or "").strip()
+    if not bs or bs == BASE_SPEAKER_NONE:
+        base_speaker_stored = ""
+    else:
+        base_speaker_stored = _speaker_id_from_ui(bs)
     
     data = {
         "name": name.strip(),
         "description": description.strip(),
-        "base_speaker": base_speaker,
+        "base_speaker": base_speaker_stored,
         "notes": notes.strip(),
         "created": datetime.now().isoformat()
     }
@@ -206,11 +218,17 @@ def load_character(name: str) -> tuple:
     
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
+
+    bs_raw = (data.get("base_speaker") or "").strip()
+    if not bs_raw:
+        base_label = BASE_SPEAKER_NONE
+    else:
+        base_label = _label_for_speaker_id(bs_raw)
     
     return (
         gr.update(value=data.get("name", name)),
         gr.update(value=data.get("description", "")),
-        gr.update(value=data.get("base_speaker", "vivian")),
+        gr.update(value=base_label),
         gr.update(value=data.get("notes", ""))
     )
 
@@ -256,6 +274,161 @@ def get_character_voice_description(character_name: str) -> str:
     
     # Return a basic description if character not found
     return f"Neutral voice for {character_name}"
+
+
+def concatenate_audio_files(audio_files: list, output_path: str, pause_duration: float = 0.3) -> bool:
+    """
+    Concatenate multiple WAV files with optional pauses between them.
+    
+    Args:
+        audio_files: List of paths to WAV files to concatenate
+        output_path: Path where the concatenated audio should be saved
+        pause_duration: Duration of silence to add between files (in seconds)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if not audio_files:
+        return False
+    
+    try:
+        # Read all audio files and collect their data
+        audio_data = []
+        sample_rate = None
+        
+        for file_path in audio_files:
+            if not os.path.exists(file_path):
+                continue
+                
+            with wave.open(file_path, 'rb') as wav_file:
+                if sample_rate is None:
+                    sample_rate = wav_file.getframerate()
+                    channels = wav_file.getnchannels()
+                    sample_width = wav_file.getsampwidth()
+                
+                # Read audio data
+                frames = wav_file.readframes(wav_file.getnframes())
+                audio_data.append(frames)
+                
+                # Add pause between files (except after the last one)
+                if file_path != audio_files[-1] and pause_duration > 0:
+                    pause_samples = int(sample_rate * pause_duration * channels)
+                    pause_data = b'\x00' * (pause_samples * sample_width)
+                    audio_data.append(pause_data)
+        
+        if not audio_data or sample_rate is None:
+            return False
+        
+        # Write concatenated audio
+        with wave.open(output_path, 'wb') as output_wav:
+            output_wav.setnchannels(channels)
+            output_wav.setsampwidth(sample_width)
+            output_wav.setframerate(sample_rate)
+            
+            for data in audio_data:
+                output_wav.writeframes(data)
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error concatenating audio files: {e}")
+        return False
+
+
+def generate_multi_character_dialogue(dialogue_text: str, lang_code: str, temperature: float, 
+                                    autoplay: bool, remove_linebreaks: bool, history: list):
+    """Generate audio for multi-character dialogue using Voice Design model."""
+    if not dialogue_text or not dialogue_text.strip():
+        return None, "Please enter dialogue text.", *_fail(history)
+    
+    # Parse the dialogue
+    dialogue_lines = parse_dialogue(dialogue_text)
+    if not dialogue_lines:
+        return None, "No valid dialogue found. Use format 'Character: Line of dialogue'", *_fail(history)
+    
+    model_key = MODE_TO_KEY["design"]  # Use Voice Design model for character voices
+    subfolder = "MultiCharacter"
+    
+    try:
+        model = get_model(model_key)
+    except RuntimeError as e:
+        return None, str(e), *_fail(history)
+    
+    # Generate audio for each line and combine them
+    temp_dir = f"temp_{int(time.time())}"
+    combined_audio_files = []
+    
+    try:
+        for i, (character, line) in enumerate(dialogue_lines):
+            line_text = _text_for_model(line, remove_linebreaks)
+            if not line_text.strip():
+                continue
+                
+            # Get character voice description
+            voice_description = get_character_voice_description(character)
+            
+            # Create individual temp directory for this line
+            line_temp_dir = f"{temp_dir}_line_{i}"
+            
+            # Generate audio for this line
+            generate_audio(
+                model=model, 
+                text=line_text,
+                instruct=voice_description,
+                lang_code=lang_code, 
+                temperature=temperature, 
+                output_path=line_temp_dir
+            )
+            
+            # Check if audio was generated
+            line_audio = os.path.join(line_temp_dir, "audio_000.wav")
+            if os.path.exists(line_audio):
+                combined_audio_files.append(line_audio)
+        
+        if not combined_audio_files:
+            return None, "No audio files were generated.", *_fail(history)
+        
+        # Save the output
+        save_path = os.path.join(BASE_OUTPUT_DIR, subfolder)
+        os.makedirs(save_path, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%H-%M-%S")
+        filename = f"{timestamp}_dialogue.wav"
+        final_path = os.path.join(save_path, filename)
+        
+        # Concatenate all audio files
+        if len(combined_audio_files) == 1:
+            # Single file, just copy it
+            shutil.copy(combined_audio_files[0], final_path)
+        else:
+            # Multiple files, concatenate them with pauses
+            success = concatenate_audio_files(combined_audio_files, final_path, pause_duration=0.5)
+            if not success:
+                return None, "Failed to concatenate audio files.", *_fail(history)
+        
+        # Clean up temp directories
+        for temp in [temp_dir] + [f"{temp_dir}_line_{i}" for i in range(len(dialogue_lines))]:
+            if os.path.exists(temp):
+                shutil.rmtree(temp, ignore_errors=True)
+        
+        if os.path.exists(final_path):
+            _maybe_play(final_path, autoplay)
+            new_history, df_data = _add_to_history(history, final_path, "Multi-Character", dialogue_text[:60])
+            
+            # Create detailed status message
+            characters_used = list(set(char for char, _ in dialogue_lines))
+            status_msg = f"Generated dialogue with {len(dialogue_lines)} lines from {len(characters_used)} characters: {', '.join(characters_used)}. Saved to outputs/{subfolder}/{filename}"
+            
+            return final_path, status_msg, new_history, df_data
+        
+        return None, "Generation failed: output file not found.", *_fail(history)
+        
+    except Exception as e:
+        # Clean up on error
+        for temp in [temp_dir] + [f"{temp_dir}_line_{i}" for i in range(len(dialogue_lines))]:
+            if os.path.exists(temp):
+                shutil.rmtree(temp, ignore_errors=True)
+        return None, f"Error: {e}", *_fail(history)
 
 
 def get_presets(category: str) -> list:
@@ -554,10 +727,22 @@ def refresh_voices():
     return gr.update(choices=voices, value=voices[0] if voices else None)
 
 
+def save_quick_clone_voice(voice_name: str, ref_audio_path: str, ref_text: str):
+    """Save a Quick Clone voice to the library."""
+    if not voice_name or not voice_name.strip():
+        return "Please enter a voice name to save.", gr.update()
+    if not ref_audio_path:
+        return "Please upload a reference audio file first.", gr.update()
+
+    # Use the existing enroll_voice function
+    result, dropdown_update = enroll_voice(voice_name, ref_audio_path, ref_text)
+    return result, dropdown_update
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-def _settings_row():
-    """Language + options row; temperature in a collapsible accordion."""
+def _global_settings():
+    """Global settings that apply to all generation modes."""
     with gr.Row():
         lang = gr.Dropdown(choices=LANG_CHOICES, value="auto", label="Language", scale=2)
         ap = gr.Checkbox(label="Auto-play when done", value=False, scale=1)
@@ -566,7 +751,7 @@ def _settings_row():
             value=False,
             scale=2,
         )
-    with gr.Accordion("Temperature", open=False):
+    with gr.Accordion("Advanced Settings", open=False):
         temp = gr.Slider(
             minimum=0.1, maximum=1.5, value=0.7, step=0.05,
             label="Sampling temperature (default 0.7)",
@@ -579,12 +764,16 @@ def build_ui():
     emotion_placeholder = "e.g. " + " / ".join(EMOTION_EXAMPLES[:2])
     emotion_presets = get_presets("emotion")
     design_presets = get_presets("voice_design")
+    characters = get_characters()
 
     with gr.Blocks(theme=gr.themes.Default(), title="Qwen3-TTS", css=CSS) as demo:
 
         history_state = gr.State([])
 
         gr.Markdown("# Qwen3-TTS\nLocal AI text-to-speech on Apple Silicon via MLX.")
+        
+        # Global settings that apply to all tabs
+        global_lang, global_temp, global_ap, global_nlb = _global_settings()
 
         with gr.Tabs():
 
@@ -614,7 +803,6 @@ def build_ui():
                 cv_text = gr.Textbox(
                     label="Text to speak", placeholder="Enter your text here...", lines=4,
                 )
-                cv_lang, cv_temp, cv_ap, cv_nlb = _settings_row()
                 cv_btn = gr.Button("Generate", variant="primary")
                 cv_audio = gr.Audio(label="Output", type="filepath", interactive=False)
                 cv_status = gr.Textbox(label="Status", interactive=False, lines=1)
@@ -638,7 +826,6 @@ def build_ui():
                 vd_text = gr.Textbox(
                     label="Text to speak", placeholder="Enter your text here...", lines=4,
                 )
-                vd_lang, vd_temp, vd_ap, vd_nlb = _settings_row()
                 vd_btn = gr.Button("Generate", variant="primary")
                 vd_audio = gr.Audio(label="Output", type="filepath", interactive=False)
                 vd_status = gr.Textbox(label="Status", interactive=False, lines=1)
@@ -658,7 +845,6 @@ def build_ui():
                         sv_text = gr.Textbox(
                             label="Text to speak", placeholder="Enter your text here...", lines=4,
                         )
-                        sv_lang, sv_temp, sv_ap, sv_nlb = _settings_row()
                         sv_btn = gr.Button("Generate", variant="primary")
                         sv_audio = gr.Audio(label="Output", type="filepath", interactive=False)
                         sv_status = gr.Textbox(label="Status", interactive=False, lines=1)
@@ -684,7 +870,7 @@ def build_ui():
                     with gr.Tab("Quick Clone"):
                         gr.Markdown(
                             "Upload any audio clip (5-10 s works best) and optionally provide "
-                            "the exact transcript of what is said. Not saved to the library."
+                            "the exact transcript of what is said. You can also save the voice to your library."
                         )
                         qc_audio_in = gr.Audio(
                             label="Reference audio", type="filepath", sources=["upload"],
@@ -694,13 +880,71 @@ def build_ui():
                             placeholder="Type exactly what the reference audio says...",
                             lines=2,
                         )
+                        
+                        with gr.Accordion("Save Voice to Library", open=False):
+                            qc_save_name = gr.Textbox(
+                                label="Voice name (optional)", 
+                                placeholder="e.g. Boss, Mom, Narrator", 
+                                lines=1
+                            )
+                            qc_save_btn = gr.Button("Save Voice to Library")
+                            qc_save_status = gr.Textbox(label="Save Status", interactive=False, lines=1)
+                        
                         qc_text = gr.Textbox(
                             label="Text to speak", placeholder="Enter your text here...", lines=4,
                         )
-                        qc_lang, qc_temp, qc_ap, qc_nlb = _settings_row()
                         qc_btn = gr.Button("Generate", variant="primary")
                         qc_audio_out = gr.Audio(label="Output", type="filepath", interactive=False)
                         qc_status = gr.Textbox(label="Status", interactive=False, lines=1)
+
+            # ── Multi-Character Dialogue ───────────────────────────────────────
+            with gr.Tab("Multi-Character Dialogue"):
+                gr.Markdown(
+                    "Create conversations between multiple characters. Each character can have "
+                    "their own unique voice profile. Use format: `Character: Line of dialogue`"
+                )
+                
+                with gr.Accordion("Character Management", open=False):
+                    with gr.Row():
+                        char_dropdown = gr.Dropdown(
+                            choices=characters, value=None, label="Load Character",
+                            scale=2, interactive=True,
+                        )
+                        char_refresh = gr.Button("Refresh", scale=1)
+                    
+                    char_name = gr.Textbox(
+                        label="Character Name", placeholder="e.g. Lucas, Mia", lines=1
+                    )
+                    char_description = gr.Textbox(
+                        label="Voice Description",
+                        placeholder="e.g. Male, 17 years old, tenor range, gaining confidence - deeper breath support now, though vowels still tighten when nervous",
+                        lines=3
+                    )
+                    char_base_speaker = gr.Dropdown(
+                        choices=BASE_SPEAKER_DROPDOWN_CHOICES,
+                        value=BASE_SPEAKER_NONE,
+                        label="Base Speaker (optional)",
+                    )
+                    char_notes = gr.Textbox(
+                        label="Notes (optional)", placeholder="Additional character notes...", lines=2
+                    )
+                    
+                    with gr.Row():
+                        char_save = gr.Button("Save Character", variant="primary")
+                        char_status = gr.Textbox(label="Status", interactive=False, lines=1, scale=2)
+                
+                dialogue_text = gr.Textbox(
+                    label="Dialogue Script",
+                    placeholder="""Lucas: H-hey! You dropped your... uh... calculus notebook? I mean, I think it's yours? Maybe?
+Mia: Oh wow, my mortal enemy - Mr. Thompson's problem sets. Thanks for rescuing me from that F.
+Lucas: No problem! I actually... kinda finished those already? If you want to compare answers or something...
+Mia: Is this your sneaky way of saying you want to study together, Lucas?""",
+                    lines=8
+                )
+                
+                dialogue_btn = gr.Button("Generate Dialogue", variant="primary")
+                dialogue_audio = gr.Audio(label="Output", type="filepath", interactive=False)
+                dialogue_status = gr.Textbox(label="Status", interactive=False, lines=2)
 
         # ── History ────────────────────────────────────────────────────────
         with gr.Accordion("Generation History", open=True):
@@ -742,23 +986,28 @@ def build_ui():
         # Generate
         cv_btn.click(
             fn=generate_custom,
-            inputs=[cv_speaker, cv_emotion, cv_speed, cv_text, cv_lang, cv_temp, cv_ap, cv_nlb, history_state],
+            inputs=[cv_speaker, cv_emotion, cv_speed, cv_text, global_lang, global_temp, global_ap, global_nlb, history_state],
             outputs=[cv_audio, cv_status, history_state, history_df],
         )
         vd_btn.click(
             fn=generate_design,
-            inputs=[vd_description, vd_text, vd_lang, vd_temp, vd_ap, vd_nlb, history_state],
+            inputs=[vd_description, vd_text, global_lang, global_temp, global_ap, global_nlb, history_state],
             outputs=[vd_audio, vd_status, history_state, history_df],
         )
         sv_btn.click(
             fn=generate_clone_saved,
-            inputs=[sv_dropdown, sv_text, sv_lang, sv_temp, sv_ap, sv_nlb, history_state],
+            inputs=[sv_dropdown, sv_text, global_lang, global_temp, global_ap, global_nlb, history_state],
             outputs=[sv_audio, sv_status, history_state, history_df],
         )
         qc_btn.click(
             fn=generate_clone_quick,
-            inputs=[qc_audio_in, qc_ref_text, qc_text, qc_lang, qc_temp, qc_ap, qc_nlb, history_state],
+            inputs=[qc_audio_in, qc_ref_text, qc_text, global_lang, global_temp, global_ap, global_nlb, history_state],
             outputs=[qc_audio_out, qc_status, history_state, history_df],
+        )
+        qc_save_btn.click(
+            fn=save_quick_clone_voice,
+            inputs=[qc_save_name, qc_audio_in, qc_ref_text],
+            outputs=[qc_save_status, sv_dropdown],
         )
 
         en_btn.click(
@@ -767,6 +1016,27 @@ def build_ui():
             outputs=[en_status, sv_dropdown],
         )
         sv_refresh.click(fn=refresh_voices, outputs=[sv_dropdown])
+
+        # Multi-Character Dialogue handlers
+        char_dropdown.change(
+            fn=load_character,
+            inputs=[char_dropdown],
+            outputs=[char_name, char_description, char_base_speaker, char_notes],
+        )
+        char_save.click(
+            fn=save_character,
+            inputs=[char_name, char_description, char_base_speaker, char_notes],
+            outputs=[char_status, char_dropdown],
+        )
+        char_refresh.click(
+            fn=lambda: gr.update(choices=get_characters()),
+            outputs=[char_dropdown]
+        )
+        dialogue_btn.click(
+            fn=generate_multi_character_dialogue,
+            inputs=[dialogue_text, global_lang, global_temp, global_ap, global_nlb, history_state],
+            outputs=[dialogue_audio, dialogue_status, history_state, history_df],
+        )
 
         history_df.select(
             fn=select_history_row,
