@@ -44,12 +44,18 @@ MODELS = {
     "6": {"name": "Voice Cloning", "folder": "Qwen3-TTS-12Hz-0.6B-Base-8bit", "mode": "clone_manager", "output_subfolder": "Clones"},
 }
 
-SPEAKER_MAP = {
-    "English": ["Ryan", "Aiden", "Ethan", "Chelsie", "Serena", "Vivian"],
-    "Chinese": ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric"],
-    "Japanese": ["Ono_Anna"],
-    "Korean": ["Sohee"]
-}
+# Display label (language + gender in parentheses) and lowercase API voice id for the model
+SPEAKER_CHOICES = [
+    ("Vivian (English, female)", "vivian"),
+    ("Serena (English, female)", "serena"),
+    ("Ryan (English, male)", "ryan"),
+    ("Aiden (English, male)", "aiden"),
+    ("Uncle Fu (Chinese, male)", "uncle_fu"),
+    ("Dylan (Chinese, male)", "dylan"),
+    ("Eric (Chinese, male)", "eric"),
+    ("Ono Anna (Japanese, female)", "ono_anna"),
+    ("Sohee (Korean, female)", "sohee"),
+]
 
 EMOTION_EXAMPLES = [
     "Sad and crying, speaking slowly",
@@ -237,15 +243,22 @@ def run_custom_session(model_key):
         return
 
     print(f"\n--- {info['name']} ---")
-    speaker = "Vivian"
-    all_speakers = [n for names in SPEAKER_MAP.values() for n in names]
-    print("Available Speakers: " + ", ".join(all_speakers))
+    speaker = "vivian"
+    print("Available speakers:")
+    for label, sid in SPEAKER_CHOICES:
+        print(f"  {label}  [{sid}]")
 
-    user_choice = input("\nSelect Speaker (Name): ").strip()
-    for lang, names in SPEAKER_MAP.items():
-        if user_choice in names:
-            speaker = user_choice
-            break
+    raw = input("\nSelect speaker (1–9, voice id e.g. vivian, or full label): ").strip()
+    if raw.isdigit():
+        i = int(raw) - 1
+        if 0 <= i < len(SPEAKER_CHOICES):
+            speaker = SPEAKER_CHOICES[i][1]
+    else:
+        lc = raw.lower()
+        for label, sid in SPEAKER_CHOICES:
+            if lc == sid or lc == label.lower():
+                speaker = sid
+                break
     print(f"Using: {speaker}")
 
     print("\nEmotion Examples:")
