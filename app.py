@@ -41,11 +41,16 @@ from datetime import datetime
 _model_cache: dict = {}
 
 PRESETS_DIR = os.path.join(os.getcwd(), "presets")
+APP_SETTINGS_PATH = os.path.join(PRESETS_DIR, "app_settings.json")
 
 MODE_TO_KEY = {"custom": "1", "design": "2", "clone": "3"}
 
 SPEED_MAP = {"Normal (1.0x)": 1.0, "Fast (1.3x)": 1.3, "Slow (0.8x)": 0.8}
 
+# Labels → lang_code for mlx_audio.generate_audio. Qwen3-TTS officially documents 10
+# languages (see https://qwenlm-qwen3-tts.mintlify.app/concepts/languages); Thai and
+# some other codes are passed through for convenience — use Auto or a documented
+# language when quality matters.
 LANG_CHOICES = [
     ("Auto", "auto"),
     ("English", "english"),
@@ -60,6 +65,7 @@ LANG_CHOICES = [
     ("Arabic", "arabic"),
     ("Russian", "russian"),
     ("Dutch", "dutch"),
+    ("Thai", "thai"),
 ]
 
 SPEAKER_LABELS = [label for label, _ in SPEAKER_CHOICES]
@@ -96,7 +102,73 @@ def _text_for_model(text: str, remove_linebreaks: bool) -> str:
     return " ".join(text.split())
 
 
-CSS = ""
+def _segments_for_history(text: str) -> list[str]:
+    """Split text into non-empty lines (used for Separate by line)."""
+    if not text:
+        return []
+    return [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+
+
+DEFAULT_APP_SETTINGS = {
+    "lang": "auto",
+    "temperature": 0.7,
+    "autoplay": False,
+    "remove_linebreaks": False,
+    "separate_by_line": False,
+}
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    try:
+        x = float(x)
+    except Exception:
+        return lo
+    return max(lo, min(hi, x))
+
+
+def load_app_settings() -> dict:
+    """Load persisted UI settings. Returns a validated dict."""
+    allowed_langs = {v for _, v in LANG_CHOICES}
+    data = {}
+    try:
+        if os.path.exists(APP_SETTINGS_PATH):
+            with open(APP_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+    except Exception:
+        data = {}
+
+    lang = data.get("lang", DEFAULT_APP_SETTINGS["lang"])
+    if lang not in allowed_langs:
+        lang = DEFAULT_APP_SETTINGS["lang"]
+
+    temp = _clamp(data.get("temperature", DEFAULT_APP_SETTINGS["temperature"]), 0.1, 1.5)
+    ap = bool(data.get("autoplay", DEFAULT_APP_SETTINGS["autoplay"]))
+    nlb = bool(data.get("remove_linebreaks", DEFAULT_APP_SETTINGS["remove_linebreaks"]))
+    sbl = bool(data.get("separate_by_line", DEFAULT_APP_SETTINGS["separate_by_line"]))
+
+    if nlb and sbl:
+        sbl = False
+
+    return {
+        "lang": lang,
+        "temperature": temp,
+        "autoplay": ap,
+        "remove_linebreaks": nlb,
+        "separate_by_line": sbl,
+    }
+
+
+def save_app_settings(settings: dict) -> None:
+    os.makedirs(PRESETS_DIR, exist_ok=True)
+    with open(APP_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+
+
+CSS = """
+.global-settings-row {
+  align-items: center !important;
+}
+"""
 
 
 def _play_audio(path: str):
@@ -142,8 +214,12 @@ def _save_output(temp_dir: str, subfolder: str, text: str) -> str:
     clean_text = (
         re.sub(r"[^\w\s-]", "", text)[:20].strip().replace(" ", "_") or "audio"
     )
-    filename = f"{timestamp}_{clean_text}.wav"
-    final_path = os.path.join(save_path, filename)
+    base = os.path.join(save_path, f"{timestamp}_{clean_text}")
+    final_path = f"{base}.wav"
+    i = 1
+    while os.path.exists(final_path):
+        final_path = f"{base}_{i}.wav"
+        i += 1
 
     source = os.path.join(temp_dir, "audio_000.wav")
     if os.path.exists(source):
@@ -153,6 +229,48 @@ def _save_output(temp_dir: str, subfolder: str, text: str) -> str:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     return final_path if os.path.exists(final_path) else None
+
+
+def _save_all_outputs(temp_dir: str, subfolder: str, text_lines: list[str]) -> list[str]:
+    """
+    Save all generated audio clips from a temp folder (audio_000.wav, audio_001.wav, ...)
+    into the outputs/<subfolder>/ directory.
+    """
+    save_path = os.path.join(BASE_OUTPUT_DIR, subfolder)
+    os.makedirs(save_path, exist_ok=True)
+
+    out_paths: list[str] = []
+    try:
+        if not os.path.isdir(temp_dir):
+            return []
+
+        wavs = [
+            f for f in os.listdir(temp_dir)
+            if re.fullmatch(r"audio_\d{3}\.wav", f)
+        ]
+        wavs.sort()
+
+        timestamp = datetime.now().strftime("%H-%M-%S")
+        for idx, fname in enumerate(wavs):
+            source = os.path.join(temp_dir, fname)
+            snippet = text_lines[idx] if idx < len(text_lines) else (text_lines[0] if text_lines else "audio")
+            clean_text = (
+                re.sub(r"[^\w\s-]", "", snippet)[:20].strip().replace(" ", "_") or "audio"
+            )
+            base = os.path.join(save_path, f"{timestamp}_{clean_text}_{idx+1:02d}")
+            final_path = f"{base}.wav"
+            n = 1
+            while os.path.exists(final_path):
+                final_path = f"{base}_{n}.wav"
+                n += 1
+            shutil.move(source, final_path)
+            if os.path.exists(final_path):
+                out_paths.append(final_path)
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return out_paths
 
 
 # ── Preset helpers ────────────────────────────────────────────────────────────
@@ -171,8 +289,8 @@ def get_characters() -> list:
     return sorted(f[:-5] for f in os.listdir(path) if f.endswith(".json"))
 
 
-def save_character(name: str, description: str, base_speaker: str, notes: str = "") -> tuple:
-    """Save a character profile with voice description."""
+def save_character(name: str, description: str, base_speaker: str) -> tuple:
+    """Save a character profile with voice description (notes not editable in UI)."""
     if not name or not name.strip():
         return "Enter a character name first.", gr.update()
     if not description or not description.strip():
@@ -185,6 +303,16 @@ def save_character(name: str, description: str, base_speaker: str, notes: str = 
     path = _preset_path("characters")
     os.makedirs(path, exist_ok=True)
 
+    existing_notes = ""
+    existing_path = os.path.join(path, f"{safe}.json")
+    if os.path.exists(existing_path):
+        try:
+            with open(existing_path, "r", encoding="utf-8") as f:
+                existing = json.load(f) or {}
+            existing_notes = (existing.get("notes") or "").strip()
+        except Exception:
+            existing_notes = ""
+
     bs = (base_speaker or "").strip()
     if not bs or bs == BASE_SPEAKER_NONE:
         base_speaker_stored = ""
@@ -195,11 +323,11 @@ def save_character(name: str, description: str, base_speaker: str, notes: str = 
         "name": name.strip(),
         "description": description.strip(),
         "base_speaker": base_speaker_stored,
-        "notes": notes.strip(),
+        "notes": existing_notes,
         "created": datetime.now().isoformat()
     }
     
-    with open(os.path.join(path, f"{safe}.json"), "w", encoding="utf-8") as f:
+    with open(existing_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     
     characters = get_characters()
@@ -207,8 +335,8 @@ def save_character(name: str, description: str, base_speaker: str, notes: str = 
 
 
 def load_character(name: str) -> tuple:
-    """Load character profile and return (name, description, base_speaker, notes)."""
-    nc = (gr.update(),) * 4
+    """Load character profile and return (name, description, base_speaker)."""
+    nc = (gr.update(),) * 3
     if not name:
         return nc
     
@@ -229,7 +357,6 @@ def load_character(name: str) -> tuple:
         gr.update(value=data.get("name", name)),
         gr.update(value=data.get("description", "")),
         gr.update(value=base_label),
-        gr.update(value=data.get("notes", ""))
     )
 
 
@@ -262,18 +389,20 @@ def parse_dialogue(dialogue_text: str) -> list:
     return lines
 
 
-def get_character_voice_description(character_name: str) -> str:
-    """Get the voice description for a character, or return a default."""
+def get_character_profile(character_name: str) -> tuple[str, str | None]:
+    """Get (voice_description, base_speaker_id) for a character, with defaults."""
     characters = get_characters()
     if character_name in characters:
         filepath = os.path.join(_preset_path("characters"), f"{character_name}.json")
         if os.path.exists(filepath):
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data.get("description", f"Neutral voice for {character_name}")
+                desc = data.get("description", f"Neutral voice for {character_name}")
+                bs = (data.get("base_speaker") or "").strip()
+                return desc, (bs or None)
     
     # Return a basic description if character not found
-    return f"Neutral voice for {character_name}"
+    return f"Neutral voice for {character_name}", None
 
 
 def concatenate_audio_files(audio_files: list, output_path: str, pause_duration: float = 0.3) -> bool:
@@ -364,21 +493,24 @@ def generate_multi_character_dialogue(dialogue_text: str, lang_code: str, temper
             if not line_text.strip():
                 continue
                 
-            # Get character voice description
-            voice_description = get_character_voice_description(character)
+            # Get character voice description + optional base speaker
+            voice_description, base_speaker_id = get_character_profile(character)
             
             # Create individual temp directory for this line
             line_temp_dir = f"{temp_dir}_line_{i}"
             
             # Generate audio for this line
-            generate_audio(
-                model=model, 
-                text=line_text,
-                instruct=voice_description,
-                lang_code=lang_code, 
-                temperature=temperature, 
-                output_path=line_temp_dir
-            )
+            kwargs = {
+                "model": model,
+                "text": line_text,
+                "instruct": voice_description,
+                "lang_code": lang_code,
+                "temperature": temperature,
+                "output_path": line_temp_dir,
+            }
+            if base_speaker_id:
+                kwargs["voice"] = base_speaker_id
+            generate_audio(**kwargs)
             
             # Check if audio was generated
             line_audio = os.path.join(line_temp_dir, "audio_000.wav")
@@ -516,11 +648,39 @@ def load_preset_design(name: str):
 
 # ── History helpers ───────────────────────────────────────────────────────────
 
-def _add_to_history(history: list, path: str, mode: str, text: str):
+def _wav_duration_seconds(path: str):
+    try:
+        with wave.open(path, "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+        if not rate:
+            return None
+        return frames / float(rate)
+    except Exception:
+        return None
+
+
+def _format_duration(seconds) -> str:
+    if seconds is None:
+        return "—"
+    try:
+        seconds = float(seconds)
+    except Exception:
+        return "—"
+    if seconds < 0:
+        return "—"
+    minutes = int(seconds // 60)
+    sec = seconds - (minutes * 60)
+    return f"{minutes}:{sec:04.1f}"
+
+
+def _add_to_history(history: list, path: str, mode: str, text: str, preset: str | None = None):
     entry = {
         "path": path,
         "time": datetime.now().strftime("%H:%M:%S"),
         "mode": mode,
+        "duration": _format_duration(_wav_duration_seconds(path)),
+        "preset": (preset or "").strip() or "—",
         "text": text[:60] + ("\u2026" if len(text) > 60 else ""),
     }
     new_history = [entry] + history
@@ -530,7 +690,7 @@ def _add_to_history(history: list, path: str, mode: str, text: str):
 
 
 def _history_to_df(history: list) -> list:
-    return [[e["time"], e["mode"], e["text"]] for e in history]
+    return [[e["time"], e["mode"], e.get("duration", "—"), e.get("preset", "—"), e["text"]] for e in history]
 
 
 def _fail(history: list):
@@ -546,10 +706,12 @@ def select_history_row(history: list, evt: gr.SelectData):
 
 # ── Generation functions ──────────────────────────────────────────────────────
 
-def generate_custom(speaker, emotion, speed_label, text, lang_code, temperature, autoplay, remove_linebreaks, history):
-    tts_text = _text_for_model(text or "", remove_linebreaks)
+def generate_custom(preset_name, speaker, emotion, speed_label, text, lang_code, temperature, autoplay, remove_linebreaks, separate_by_line, history):
+    raw_text = (text or "").strip()
+    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, remove_linebreaks)
     if not tts_text.strip():
-        return None, "Please enter some text.", *_fail(history)
+        yield None, "Please enter some text.", *_fail(history)
+        return
 
     model_key = MODE_TO_KEY["custom"]
     subfolder = MODELS[model_key]["output_subfolder"]
@@ -559,9 +721,70 @@ def generate_custom(speaker, emotion, speed_label, text, lang_code, temperature,
     try:
         model = get_model(model_key)
     except RuntimeError as e:
-        return None, str(e), *_fail(history)
+        yield None, str(e), *_fail(history)
+        return
 
     voice_id = _speaker_id_from_ui(speaker)
+
+    if separate_by_line:
+        segments = _segments_for_history(tts_text)
+        if not segments:
+            yield None, "No non-empty lines found.", *_fail(history)
+            return
+
+        out_paths: list[str] = []
+        last_audio = None
+        new_history = history
+        df_data = _history_to_df(new_history)
+
+        for i, segment in enumerate(segments):
+            temp_dir = f"temp_{int(time.time() * 1000)}_{i}"
+            try:
+                generate_audio(
+                    model=model, text=segment, voice=voice_id,
+                    instruct=instruct, speed=speed,
+                    lang_code=lang_code, temperature=temperature, output_path=temp_dir,
+                )
+                out = _save_output(temp_dir, subfolder, segment)
+                if out:
+                    out_paths.append(out)
+                    last_audio = out
+                    new_history, df_data = _add_to_history(
+                        new_history, out, "Custom Voice", segment, preset=preset_name
+                    )
+                    _maybe_play(out, autoplay)
+                    yield (
+                        out,
+                        f"Saved {i+1}/{len(segments)} clip(s) to outputs/{subfolder}/ (added to history)",
+                        new_history,
+                        df_data,
+                    )
+                else:
+                    yield (
+                        last_audio,
+                        f"Generation failed for line {i+1}: output file not found.",
+                        new_history,
+                        df_data,
+                    )
+            except Exception as e:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                yield last_audio, f"Error on line {i+1}: {e}", new_history, df_data
+                return
+
+        if out_paths:
+            yield (
+                out_paths[-1],
+                f"Saved {len(out_paths)} clip(s) to outputs/{subfolder}/ (added to history)",
+                new_history,
+                df_data,
+            )
+            return
+
+        yield None, "Generation failed: output file not found.", *_fail(history)
+        return
+
+    # Normal single generation
     temp_dir = f"temp_{int(time.time())}"
     try:
         generate_audio(
@@ -572,21 +795,27 @@ def generate_custom(speaker, emotion, speed_label, text, lang_code, temperature,
         out = _save_output(temp_dir, subfolder, tts_text)
         if out:
             _maybe_play(out, autoplay)
-            new_history, df_data = _add_to_history(history, out, "Custom Voice", tts_text)
-            return out, f"Saved to outputs/{subfolder}/{os.path.basename(out)}", new_history, df_data
-        return None, "Generation failed: output file not found.", *_fail(history)
+            new_history, df_data = _add_to_history(history, out, "Custom Voice", tts_text, preset=preset_name)
+            yield out, f"Saved to outputs/{subfolder}/{os.path.basename(out)}", new_history, df_data
+            return
+        yield None, "Generation failed: output file not found.", *_fail(history)
+        return
     except Exception as e:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
-        return None, f"Error: {e}", *_fail(history)
+        yield None, f"Error: {e}", *_fail(history)
+        return
 
 
-def generate_design(voice_description, text, lang_code, temperature, autoplay, remove_linebreaks, history):
+def generate_design(preset_name, voice_description, text, lang_code, temperature, autoplay, remove_linebreaks, separate_by_line, history):
     if not voice_description or not voice_description.strip():
-        return None, "Please describe the voice.", *_fail(history)
-    tts_text = _text_for_model(text or "", remove_linebreaks)
+        yield None, "Please describe the voice.", *_fail(history)
+        return
+    raw_text = (text or "").strip()
+    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, remove_linebreaks)
     if not tts_text.strip():
-        return None, "Please enter some text.", *_fail(history)
+        yield None, "Please enter some text.", *_fail(history)
+        return
 
     model_key = MODE_TO_KEY["design"]
     subfolder = MODELS[model_key]["output_subfolder"]
@@ -594,7 +823,66 @@ def generate_design(voice_description, text, lang_code, temperature, autoplay, r
     try:
         model = get_model(model_key)
     except RuntimeError as e:
-        return None, str(e), *_fail(history)
+        yield None, str(e), *_fail(history)
+        return
+
+    if separate_by_line:
+        segments = _segments_for_history(tts_text)
+        if not segments:
+            yield None, "No non-empty lines found.", *_fail(history)
+            return
+
+        out_paths: list[str] = []
+        last_audio = None
+        new_history = history
+        df_data = _history_to_df(new_history)
+
+        for i, segment in enumerate(segments):
+            temp_dir = f"temp_{int(time.time() * 1000)}_{i}"
+            try:
+                generate_audio(
+                    model=model, text=segment,
+                    instruct=voice_description.strip(),
+                    lang_code=lang_code, temperature=temperature, output_path=temp_dir,
+                )
+                out = _save_output(temp_dir, subfolder, segment)
+                if out:
+                    out_paths.append(out)
+                    last_audio = out
+                    new_history, df_data = _add_to_history(
+                        new_history, out, "Voice Design", segment, preset=preset_name
+                    )
+                    _maybe_play(out, autoplay)
+                    yield (
+                        out,
+                        f"Saved {i+1}/{len(segments)} clip(s) to outputs/{subfolder}/ (added to history)",
+                        new_history,
+                        df_data,
+                    )
+                else:
+                    yield (
+                        last_audio,
+                        f"Generation failed for line {i+1}: output file not found.",
+                        new_history,
+                        df_data,
+                    )
+            except Exception as e:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                yield last_audio, f"Error on line {i+1}: {e}", new_history, df_data
+                return
+
+        if out_paths:
+            yield (
+                out_paths[-1],
+                f"Saved {len(out_paths)} clip(s) to outputs/{subfolder}/ (added to history)",
+                new_history,
+                df_data,
+            )
+            return
+
+        yield None, "Generation failed: output file not found.", *_fail(history)
+        return
 
     temp_dir = f"temp_{int(time.time())}"
     try:
@@ -606,21 +894,27 @@ def generate_design(voice_description, text, lang_code, temperature, autoplay, r
         out = _save_output(temp_dir, subfolder, tts_text)
         if out:
             _maybe_play(out, autoplay)
-            new_history, df_data = _add_to_history(history, out, "Voice Design", tts_text)
-            return out, f"Saved to outputs/{subfolder}/{os.path.basename(out)}", new_history, df_data
-        return None, "Generation failed: output file not found.", *_fail(history)
+            new_history, df_data = _add_to_history(history, out, "Voice Design", tts_text, preset=preset_name)
+            yield out, f"Saved to outputs/{subfolder}/{os.path.basename(out)}", new_history, df_data
+            return
+        yield None, "Generation failed: output file not found.", *_fail(history)
+        return
     except Exception as e:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
-        return None, f"Error: {e}", *_fail(history)
+        yield None, f"Error: {e}", *_fail(history)
+        return
 
 
-def generate_clone_saved(voice_name, text, lang_code, temperature, autoplay, remove_linebreaks, history):
+def generate_clone_saved(voice_name, text, lang_code, temperature, autoplay, remove_linebreaks, separate_by_line, history):
     if not voice_name:
-        return None, "No voice selected. Enroll a voice first.", *_fail(history)
-    tts_text = _text_for_model(text or "", remove_linebreaks)
+        yield None, "No voice selected. Enroll a voice first.", *_fail(history)
+        return
+    raw_text = (text or "").strip()
+    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, remove_linebreaks)
     if not tts_text.strip():
-        return None, "Please enter some text.", *_fail(history)
+        yield None, "Please enter some text.", *_fail(history)
+        return
 
     model_key = MODE_TO_KEY["clone"]
     subfolder = MODELS[model_key]["output_subfolder"]
@@ -635,7 +929,64 @@ def generate_clone_saved(voice_name, text, lang_code, temperature, autoplay, rem
     try:
         model = get_model(model_key)
     except RuntimeError as e:
-        return None, str(e), *_fail(history)
+        yield None, str(e), *_fail(history)
+        return
+
+    if separate_by_line:
+        segments = _segments_for_history(tts_text)
+        if not segments:
+            yield None, "No non-empty lines found.", *_fail(history)
+            return
+
+        out_paths: list[str] = []
+        last_audio = None
+        new_history = history
+        df_data = _history_to_df(new_history)
+
+        for i, segment in enumerate(segments):
+            temp_dir = f"temp_{int(time.time() * 1000)}_{i}"
+            try:
+                generate_audio(
+                    model=model, text=segment,
+                    ref_audio=ref_audio, ref_text=ref_text,
+                    lang_code=lang_code, temperature=temperature, output_path=temp_dir,
+                )
+                out = _save_output(temp_dir, subfolder, segment)
+                if out:
+                    out_paths.append(out)
+                    last_audio = out
+                    new_history, df_data = _add_to_history(new_history, out, f"Clone: {voice_name}", segment)
+                    _maybe_play(out, autoplay)
+                    yield (
+                        out,
+                        f"Saved {i+1}/{len(segments)} clip(s) to outputs/{subfolder}/ (added to history)",
+                        new_history,
+                        df_data,
+                    )
+                else:
+                    yield (
+                        last_audio,
+                        f"Generation failed for line {i+1}: output file not found.",
+                        new_history,
+                        df_data,
+                    )
+            except Exception as e:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                yield last_audio, f"Error on line {i+1}: {e}", new_history, df_data
+                return
+
+        if out_paths:
+            yield (
+                out_paths[-1],
+                f"Saved {len(out_paths)} clip(s) to outputs/{subfolder}/ (added to history)",
+                new_history,
+                df_data,
+            )
+            return
+
+        yield None, "Generation failed: output file not found.", *_fail(history)
+        return
 
     temp_dir = f"temp_{int(time.time())}"
     try:
@@ -648,52 +999,121 @@ def generate_clone_saved(voice_name, text, lang_code, temperature, autoplay, rem
         if out:
             _maybe_play(out, autoplay)
             new_history, df_data = _add_to_history(history, out, f"Clone: {voice_name}", tts_text)
-            return out, f"Saved to outputs/{subfolder}/{os.path.basename(out)}", new_history, df_data
-        return None, "Generation failed: output file not found.", *_fail(history)
+            yield out, f"Saved to outputs/{subfolder}/{os.path.basename(out)}", new_history, df_data
+            return
+        yield None, "Generation failed: output file not found.", *_fail(history)
+        return
     except Exception as e:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
-        return None, f"Error: {e}", *_fail(history)
+        yield None, f"Error: {e}", *_fail(history)
+        return
 
 
-def generate_clone_quick(ref_audio_path, ref_text, text, lang_code, temperature, autoplay, remove_linebreaks, history):
+def generate_clone_quick(ref_audio_path, ref_text, text, lang_code, temperature, autoplay, remove_linebreaks, separate_by_line, history):
     if not ref_audio_path:
-        return None, "Please upload a reference audio file.", *_fail(history)
-    tts_text = _text_for_model(text or "", remove_linebreaks)
+        yield None, "Please upload a reference audio file.", *_fail(history)
+        return
+    raw_text = (text or "").strip()
+    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, remove_linebreaks)
     if not tts_text.strip():
-        return None, "Please enter some text.", *_fail(history)
+        yield None, "Please enter some text.", *_fail(history)
+        return
 
     model_key = MODE_TO_KEY["clone"]
     subfolder = MODELS[model_key]["output_subfolder"]
 
     converted = convert_audio_if_needed(ref_audio_path)
     if not converted:
-        return None, "Could not read/convert the reference audio. Is ffmpeg installed?", *_fail(history)
+        yield None, "Could not read/convert the reference audio. Is ffmpeg installed?", *_fail(history)
+        return
 
     try:
         model = get_model(model_key)
     except RuntimeError as e:
-        return None, str(e), *_fail(history)
+        if converted != ref_audio_path and os.path.exists(converted):
+            os.remove(converted)
+        yield None, str(e), *_fail(history)
+        return
 
-    temp_dir = f"temp_{int(time.time())}"
     try:
+        if separate_by_line:
+            segments = _segments_for_history(tts_text)
+            if not segments:
+                yield None, "No non-empty lines found.", *_fail(history)
+                return
+
+            out_paths: list[str] = []
+            last_audio = None
+            new_history = history
+            df_data = _history_to_df(new_history)
+
+            for i, segment in enumerate(segments):
+                temp_dir = f"temp_{int(time.time() * 1000)}_{i}"
+                try:
+                    generate_audio(
+                        model=model, text=segment,
+                        ref_audio=converted, ref_text=ref_text.strip() or ".",
+                        lang_code=lang_code, temperature=temperature, output_path=temp_dir,
+                    )
+                    out = _save_output(temp_dir, subfolder, segment)
+                    if out:
+                        out_paths.append(out)
+                        last_audio = out
+                        new_history, df_data = _add_to_history(new_history, out, "Quick Clone", segment)
+                        _maybe_play(out, autoplay)
+                        yield (
+                            out,
+                            f"Saved {i+1}/{len(segments)} clip(s) to outputs/{subfolder}/ (added to history)",
+                            new_history,
+                            df_data,
+                        )
+                    else:
+                        yield (
+                            last_audio,
+                            f"Generation failed for line {i+1}: output file not found.",
+                            new_history,
+                            df_data,
+                        )
+                except Exception as e:
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                    yield last_audio, f"Error on line {i+1}: {e}", new_history, df_data
+                    return
+
+            if out_paths:
+                yield (
+                    out_paths[-1],
+                    f"Saved {len(out_paths)} clip(s) to outputs/{subfolder}/ (added to history)",
+                    new_history,
+                    df_data,
+                )
+                return
+
+            yield None, "Generation failed: output file not found.", *_fail(history)
+            return
+
+        temp_dir = f"temp_{int(time.time())}"
         generate_audio(
             model=model, text=tts_text,
             ref_audio=converted, ref_text=ref_text.strip() or ".",
             lang_code=lang_code, temperature=temperature, output_path=temp_dir,
         )
+
         out = _save_output(temp_dir, subfolder, tts_text)
-        if converted != ref_audio_path and os.path.exists(converted):
-            os.remove(converted)
         if out:
             _maybe_play(out, autoplay)
             new_history, df_data = _add_to_history(history, out, "Quick Clone", tts_text)
-            return out, f"Saved to outputs/{subfolder}/{os.path.basename(out)}", new_history, df_data
-        return None, "Generation failed: output file not found.", *_fail(history)
+            yield out, f"Saved to outputs/{subfolder}/{os.path.basename(out)}", new_history, df_data
+            return
+        yield None, "Generation failed: output file not found.", *_fail(history)
+        return
     except Exception as e:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        return None, f"Error: {e}", *_fail(history)
+        yield None, f"Error: {e}", *_fail(history)
+        return
+    finally:
+        if converted != ref_audio_path and converted and os.path.exists(converted):
+            os.remove(converted)
 
 
 def enroll_voice(voice_name: str, ref_audio_path: str, ref_text: str):
@@ -743,20 +1163,26 @@ def save_quick_clone_voice(voice_name: str, ref_audio_path: str, ref_text: str):
 
 def _global_settings():
     """Global settings that apply to all generation modes."""
-    with gr.Row():
-        lang = gr.Dropdown(choices=LANG_CHOICES, value="auto", label="Language", scale=2)
-        ap = gr.Checkbox(label="Auto-play when done", value=False, scale=1)
+    s = load_app_settings()
+    with gr.Row(elem_classes=["global-settings-row"]):
+        lang = gr.Dropdown(choices=LANG_CHOICES, value=s["lang"], label="Language", scale=2)
+        ap = gr.Checkbox(label="Auto-play when done", value=s["autoplay"], scale=1)
         nlb = gr.Checkbox(
             label="Remove line breaks",
-            value=False,
+            value=s["remove_linebreaks"],
             scale=2,
         )
-    with gr.Accordion("Advanced Settings", open=False):
+        sbl = gr.Checkbox(
+            label="Separate by line",
+            value=s.get("separate_by_line", False),
+            scale=2,
+        )
+    with gr.Accordion("Advanced Settings", open=False, visible=False):
         temp = gr.Slider(
-            minimum=0.1, maximum=1.5, value=0.7, step=0.05,
+            minimum=0.1, maximum=1.5, value=s["temperature"], step=0.05,
             label="Sampling temperature (default 0.7)",
         )
-    return lang, temp, ap, nlb
+    return lang, temp, ap, nlb, sbl
 
 
 def build_ui():
@@ -769,11 +1195,12 @@ def build_ui():
     with gr.Blocks(theme=gr.themes.Default(), title="Qwen3-TTS", css=CSS) as demo:
 
         history_state = gr.State([])
+        settings_state = gr.State(load_app_settings())
 
         gr.Markdown("# Qwen3-TTS\nLocal AI text-to-speech on Apple Silicon via MLX.")
         
         # Global settings that apply to all tabs
-        global_lang, global_temp, global_ap, global_nlb = _global_settings()
+        global_lang, global_temp, global_ap, global_nlb, global_sbl = _global_settings()
 
         with gr.Tabs():
 
@@ -925,9 +1352,6 @@ def build_ui():
                         value=BASE_SPEAKER_NONE,
                         label="Base Speaker (optional)",
                     )
-                    char_notes = gr.Textbox(
-                        label="Notes (optional)", placeholder="Additional character notes...", lines=2
-                    )
                     
                     with gr.Row():
                         char_save = gr.Button("Save Character", variant="primary")
@@ -949,8 +1373,8 @@ Mia: Is this your sneaky way of saying you want to study together, Lucas?""",
         # ── History ────────────────────────────────────────────────────────
         with gr.Accordion("Generation History", open=True):
             history_df = gr.Dataframe(
-                headers=["Time", "Mode", "Text preview"],
-                datatype=["str", "str", "str"],
+                headers=["Time", "Mode", "Clip length", "Preset", "Text preview"],
+                datatype=["str", "str", "str", "str", "str"],
                 interactive=False, wrap=True, label=None,
             )
             history_player = gr.Audio(
@@ -958,6 +1382,60 @@ Mia: Is this your sneaky way of saying you want to study together, Lucas?""",
             )
 
         # ── Event handlers ─────────────────────────────────────────────────
+
+        def _persist_global_settings(lang, temp, ap, nlb, sbl, _current):
+            s = {
+                "lang": lang,
+                "temperature": _clamp(temp, 0.1, 1.5),
+                "autoplay": bool(ap),
+                "remove_linebreaks": bool(nlb),
+                "separate_by_line": bool(sbl),
+            }
+            if s["remove_linebreaks"] and s["separate_by_line"]:
+                s["separate_by_line"] = False
+            save_app_settings(s)
+            return s
+
+        global_lang.change(
+            fn=_persist_global_settings,
+            inputs=[global_lang, global_temp, global_ap, global_nlb, global_sbl, settings_state],
+            outputs=[settings_state],
+        )
+        global_temp.change(
+            fn=_persist_global_settings,
+            inputs=[global_lang, global_temp, global_ap, global_nlb, global_sbl, settings_state],
+            outputs=[settings_state],
+        )
+        global_ap.change(
+            fn=_persist_global_settings,
+            inputs=[global_lang, global_temp, global_ap, global_nlb, global_sbl, settings_state],
+            outputs=[settings_state],
+        )
+
+        def _persist_from_nlb(lang, temp, ap, nlb, sbl, _current):
+            # If user turns on "Remove line breaks", "Separate by line" must turn off.
+            if bool(nlb) and bool(sbl):
+                sbl = False
+            s = _persist_global_settings(lang, temp, ap, nlb, sbl, _current)
+            return s, gr.update(value=bool(sbl))
+
+        def _persist_from_sbl(lang, temp, ap, nlb, sbl, _current):
+            # If user turns on "Separate by line", force "Remove line breaks" off.
+            if bool(sbl) and bool(nlb):
+                nlb = False
+            s = _persist_global_settings(lang, temp, ap, nlb, sbl, _current)
+            return s, gr.update(value=bool(nlb))
+
+        global_nlb.change(
+            fn=_persist_from_nlb,
+            inputs=[global_lang, global_temp, global_ap, global_nlb, global_sbl, settings_state],
+            outputs=[settings_state, global_sbl],
+        )
+        global_sbl.change(
+            fn=_persist_from_sbl,
+            inputs=[global_lang, global_temp, global_ap, global_nlb, global_sbl, settings_state],
+            outputs=[settings_state, global_nlb],
+        )
 
         # Preset: load
         cv_preset_dd.change(
@@ -986,22 +1464,22 @@ Mia: Is this your sneaky way of saying you want to study together, Lucas?""",
         # Generate
         cv_btn.click(
             fn=generate_custom,
-            inputs=[cv_speaker, cv_emotion, cv_speed, cv_text, global_lang, global_temp, global_ap, global_nlb, history_state],
+            inputs=[cv_preset_dd, cv_speaker, cv_emotion, cv_speed, cv_text, global_lang, global_temp, global_ap, global_nlb, global_sbl, history_state],
             outputs=[cv_audio, cv_status, history_state, history_df],
         )
         vd_btn.click(
             fn=generate_design,
-            inputs=[vd_description, vd_text, global_lang, global_temp, global_ap, global_nlb, history_state],
+            inputs=[vd_preset_dd, vd_description, vd_text, global_lang, global_temp, global_ap, global_nlb, global_sbl, history_state],
             outputs=[vd_audio, vd_status, history_state, history_df],
         )
         sv_btn.click(
             fn=generate_clone_saved,
-            inputs=[sv_dropdown, sv_text, global_lang, global_temp, global_ap, global_nlb, history_state],
+            inputs=[sv_dropdown, sv_text, global_lang, global_temp, global_ap, global_nlb, global_sbl, history_state],
             outputs=[sv_audio, sv_status, history_state, history_df],
         )
         qc_btn.click(
             fn=generate_clone_quick,
-            inputs=[qc_audio_in, qc_ref_text, qc_text, global_lang, global_temp, global_ap, global_nlb, history_state],
+            inputs=[qc_audio_in, qc_ref_text, qc_text, global_lang, global_temp, global_ap, global_nlb, global_sbl, history_state],
             outputs=[qc_audio_out, qc_status, history_state, history_df],
         )
         qc_save_btn.click(
@@ -1021,11 +1499,11 @@ Mia: Is this your sneaky way of saying you want to study together, Lucas?""",
         char_dropdown.change(
             fn=load_character,
             inputs=[char_dropdown],
-            outputs=[char_name, char_description, char_base_speaker, char_notes],
+            outputs=[char_name, char_description, char_base_speaker],
         )
         char_save.click(
             fn=save_character,
-            inputs=[char_name, char_description, char_base_speaker, char_notes],
+            inputs=[char_name, char_description, char_base_speaker],
             outputs=[char_status, char_dropdown],
         )
         char_refresh.click(
