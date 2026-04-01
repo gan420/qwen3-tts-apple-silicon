@@ -47,6 +47,18 @@ MODE_TO_KEY = {"custom": "1", "design": "2", "clone": "3"}
 
 SPEED_MAP = {"Normal (1.0x)": 1.0, "Fast (1.3x)": 1.3, "Slow (0.8x)": 0.8}
 
+# (label, delimiter) pairs for the "Replace line breaks" dropdown.
+# Empty string = keep line breaks as-is.
+LINEBREAK_OPTIONS = [
+    ("Keep line breaks", ""),
+    ("Space", " "),
+    ("Period", ". "),
+    ("Comma", ", "),
+    ("Hyphen", " - "),
+    ("Slash", " / "),
+]
+LINEBREAK_VALUES = [v for _, v in LINEBREAK_OPTIONS]
+
 # Labels → lang_code for mlx_audio.generate_audio. Qwen3-TTS officially documents 10
 # languages (see https://qwenlm-qwen3-tts.mintlify.app/concepts/languages); Thai and
 # some other codes are passed through for convenience — use Auto or a documented
@@ -95,11 +107,22 @@ def _label_for_speaker_id(sid: str) -> str:
     return SPEAKER_CHOICES[0][0]
 
 
-def _text_for_model(text: str, remove_linebreaks: bool) -> str:
-    """If remove_linebreaks: collapse whitespace (newlines → single spaces)."""
-    if not remove_linebreaks:
+def _text_for_model(text: str, linebreak_replacement: str) -> str:
+    """Replace line breaks with delimiter; empty string means keep as-is."""
+    if not linebreak_replacement:
         return text
-    return " ".join(text.split())
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return linebreak_replacement.join(lines)
+
+
+def _normalize_ref_text(text: str, linebreak_replacement: str) -> str:
+    """Normalize a reference transcript using the same delimiter as input text."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return "."
+    if not linebreak_replacement:
+        return "\n".join(lines)
+    return linebreak_replacement.join(lines)
 
 
 def _segments_for_history(text: str) -> list[str]:
@@ -113,7 +136,7 @@ DEFAULT_APP_SETTINGS = {
     "lang": "auto",
     "temperature": 0.7,
     "autoplay": False,
-    "remove_linebreaks": False,
+    "linebreak_replacement": "",
     "separate_by_line": False,
 }
 
@@ -143,7 +166,12 @@ def load_app_settings() -> dict:
 
     temp = _clamp(data.get("temperature", DEFAULT_APP_SETTINGS["temperature"]), 0.1, 1.5)
     ap = bool(data.get("autoplay", DEFAULT_APP_SETTINGS["autoplay"]))
-    nlb = bool(data.get("remove_linebreaks", DEFAULT_APP_SETTINGS["remove_linebreaks"]))
+    # Accept the old bool key from pre-existing settings files
+    _old_nlb = data.get("remove_linebreaks")
+    _raw_nlb = data.get("linebreak_replacement", DEFAULT_APP_SETTINGS["linebreak_replacement"])
+    if _old_nlb is True and _raw_nlb == "":
+        _raw_nlb = ", "
+    nlb = _raw_nlb if _raw_nlb in LINEBREAK_VALUES else ""
     sbl = bool(data.get("separate_by_line", DEFAULT_APP_SETTINGS["separate_by_line"]))
 
     if nlb and sbl:
@@ -153,7 +181,7 @@ def load_app_settings() -> dict:
         "lang": lang,
         "temperature": temp,
         "autoplay": ap,
-        "remove_linebreaks": nlb,
+        "linebreak_replacement": nlb,
         "separate_by_line": sbl,
     }
 
@@ -465,7 +493,7 @@ def concatenate_audio_files(audio_files: list, output_path: str, pause_duration:
 
 
 def generate_multi_character_dialogue(dialogue_text: str, lang_code: str, temperature: float, 
-                                    autoplay: bool, remove_linebreaks: bool, history: list):
+                                    autoplay: bool, linebreak_replacement: str, history: list):
     """Generate audio for multi-character dialogue using Voice Design model."""
     if not dialogue_text or not dialogue_text.strip():
         return None, "Please enter dialogue text.", *_fail(history)
@@ -489,7 +517,7 @@ def generate_multi_character_dialogue(dialogue_text: str, lang_code: str, temper
     
     try:
         for i, (character, line) in enumerate(dialogue_lines):
-            line_text = _text_for_model(line, remove_linebreaks)
+            line_text = _text_for_model(line, linebreak_replacement)
             if not line_text.strip():
                 continue
                 
@@ -706,9 +734,9 @@ def select_history_row(history: list, evt: gr.SelectData):
 
 # ── Generation functions ──────────────────────────────────────────────────────
 
-def generate_custom(preset_name, speaker, emotion, speed_label, text, lang_code, temperature, autoplay, remove_linebreaks, separate_by_line, history):
+def generate_custom(preset_name, speaker, emotion, speed_label, text, lang_code, temperature, autoplay, linebreak_replacement, separate_by_line, history):
     raw_text = (text or "").strip()
-    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, remove_linebreaks)
+    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, linebreak_replacement)
     if not tts_text.strip():
         yield None, "Please enter some text.", *_fail(history)
         return
@@ -807,12 +835,12 @@ def generate_custom(preset_name, speaker, emotion, speed_label, text, lang_code,
         return
 
 
-def generate_design(preset_name, voice_description, text, lang_code, temperature, autoplay, remove_linebreaks, separate_by_line, history):
+def generate_design(preset_name, voice_description, text, lang_code, temperature, autoplay, linebreak_replacement, separate_by_line, history):
     if not voice_description or not voice_description.strip():
         yield None, "Please describe the voice.", *_fail(history)
         return
     raw_text = (text or "").strip()
-    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, remove_linebreaks)
+    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, linebreak_replacement)
     if not tts_text.strip():
         yield None, "Please enter some text.", *_fail(history)
         return
@@ -906,12 +934,12 @@ def generate_design(preset_name, voice_description, text, lang_code, temperature
         return
 
 
-def generate_clone_saved(voice_name, text, lang_code, temperature, autoplay, remove_linebreaks, separate_by_line, history):
+def generate_clone_saved(voice_name, text, lang_code, temperature, autoplay, linebreak_replacement, separate_by_line, history):
     if not voice_name:
         yield None, "No voice selected. Enroll a voice first.", *_fail(history)
         return
     raw_text = (text or "").strip()
-    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, remove_linebreaks)
+    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, linebreak_replacement)
     if not tts_text.strip():
         yield None, "Please enter some text.", *_fail(history)
         return
@@ -924,7 +952,7 @@ def generate_clone_saved(voice_name, text, lang_code, temperature, autoplay, rem
     txt_path = os.path.join(VOICES_DIR, f"{voice_name}.txt")
     if os.path.exists(txt_path):
         with open(txt_path, "r", encoding="utf-8") as f:
-            ref_text = f.read().strip() or "."
+            ref_text = _normalize_ref_text(f.read(), linebreak_replacement)
 
     try:
         model = get_model(model_key)
@@ -1010,12 +1038,13 @@ def generate_clone_saved(voice_name, text, lang_code, temperature, autoplay, rem
         return
 
 
-def generate_clone_quick(ref_audio_path, ref_text, text, lang_code, temperature, autoplay, remove_linebreaks, separate_by_line, history):
+def generate_clone_quick(ref_audio_path, ref_text, text, lang_code, temperature, autoplay, linebreak_replacement, separate_by_line, history):
     if not ref_audio_path:
         yield None, "Please upload a reference audio file.", *_fail(history)
         return
+    ref_text = _normalize_ref_text(ref_text, linebreak_replacement)
     raw_text = (text or "").strip()
-    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, remove_linebreaks)
+    tts_text = raw_text if separate_by_line else _text_for_model(raw_text, linebreak_replacement)
     if not tts_text.strip():
         yield None, "Please enter some text.", *_fail(history)
         return
@@ -1053,7 +1082,7 @@ def generate_clone_quick(ref_audio_path, ref_text, text, lang_code, temperature,
                 try:
                     generate_audio(
                         model=model, text=segment,
-                        ref_audio=converted, ref_text=ref_text.strip() or ".",
+                        ref_audio=converted, ref_text=ref_text,
                         lang_code=lang_code, temperature=temperature, output_path=temp_dir,
                     )
                     out = _save_output(temp_dir, subfolder, segment)
@@ -1096,7 +1125,7 @@ def generate_clone_quick(ref_audio_path, ref_text, text, lang_code, temperature,
         temp_dir = f"temp_{int(time.time())}"
         generate_audio(
             model=model, text=tts_text,
-            ref_audio=converted, ref_text=ref_text.strip() or ".",
+            ref_audio=converted, ref_text=ref_text,
             lang_code=lang_code, temperature=temperature, output_path=temp_dir,
         )
 
@@ -1133,7 +1162,7 @@ def enroll_voice(voice_name: str, ref_audio_path: str, ref_text: str):
     os.makedirs(VOICES_DIR, exist_ok=True)
     shutil.copy(converted, os.path.join(VOICES_DIR, f"{safe_name}.wav"))
     with open(os.path.join(VOICES_DIR, f"{safe_name}.txt"), "w", encoding="utf-8") as f:
-        f.write(ref_text.strip())
+        f.write("\n".join(ln.strip() for ln in ref_text.splitlines() if ln.strip()))
 
     if converted != ref_audio_path and os.path.exists(converted):
         os.remove(converted)
@@ -1167,9 +1196,10 @@ def _global_settings():
     with gr.Row(elem_classes=["global-settings-row"]):
         lang = gr.Dropdown(choices=LANG_CHOICES, value=s["lang"], label="Language", scale=2)
         ap = gr.Checkbox(label="Auto-play when done", value=s["autoplay"], scale=1)
-        nlb = gr.Checkbox(
-            label="Remove line breaks",
-            value=s["remove_linebreaks"],
+        nlb = gr.Dropdown(
+            label="Replace line breaks",
+            choices=LINEBREAK_OPTIONS,
+            value=s["linebreak_replacement"],
             scale=2,
         )
         sbl = gr.Checkbox(
@@ -1177,11 +1207,25 @@ def _global_settings():
             value=s.get("separate_by_line", False),
             scale=2,
         )
-    with gr.Accordion("Advanced Settings", open=False, visible=False):
+        set_temp = gr.Checkbox(
+            label="Set Temperature",
+            value=False,
+            scale=2,
+        )
+    with gr.Accordion("Temperature", open=False, visible=False) as temp_acc:
         temp = gr.Slider(
-            minimum=0.1, maximum=1.5, value=s["temperature"], step=0.05,
+            minimum=0.1, maximum=1.5, value=DEFAULT_APP_SETTINGS["temperature"], step=0.05,
             label="Sampling temperature (default 0.7)",
         )
+
+    def _toggle_temp_visibility(enabled: bool):
+        return gr.update(visible=bool(enabled))
+
+    set_temp.change(
+        fn=_toggle_temp_visibility,
+        inputs=[set_temp],
+        outputs=[temp_acc],
+    )
     return lang, temp, ap, nlb, sbl
 
 
@@ -1196,6 +1240,10 @@ def build_ui():
 
         history_state = gr.State([])
         settings_state = gr.State(load_app_settings())
+        # Receives the df_data 4th yield from generators so history_df is never
+        # a direct output of a running function (which would trigger the loading
+        # overlay and prevent clicking the table during generation).
+        _hist_sink = gr.State(None)
 
         gr.Markdown("# Qwen3-TTS\nLocal AI text-to-speech on Apple Silicon via MLX.")
         
@@ -1384,14 +1432,15 @@ Mia: Is this your sneaky way of saying you want to study together, Lucas?""",
         # ── Event handlers ─────────────────────────────────────────────────
 
         def _persist_global_settings(lang, temp, ap, nlb, sbl, _current):
+            nlb = nlb if nlb in LINEBREAK_VALUES else ""
             s = {
                 "lang": lang,
                 "temperature": _clamp(temp, 0.1, 1.5),
                 "autoplay": bool(ap),
-                "remove_linebreaks": bool(nlb),
+                "linebreak_replacement": nlb,
                 "separate_by_line": bool(sbl),
             }
-            if s["remove_linebreaks"] and s["separate_by_line"]:
+            if s["linebreak_replacement"] and s["separate_by_line"]:
                 s["separate_by_line"] = False
             save_app_settings(s)
             return s
@@ -1413,18 +1462,18 @@ Mia: Is this your sneaky way of saying you want to study together, Lucas?""",
         )
 
         def _persist_from_nlb(lang, temp, ap, nlb, sbl, _current):
-            # If user turns on "Remove line breaks", "Separate by line" must turn off.
-            if bool(nlb) and bool(sbl):
+            # If a replacement is chosen, "Separate by line" must turn off.
+            if nlb and bool(sbl):
                 sbl = False
             s = _persist_global_settings(lang, temp, ap, nlb, sbl, _current)
             return s, gr.update(value=bool(sbl))
 
         def _persist_from_sbl(lang, temp, ap, nlb, sbl, _current):
-            # If user turns on "Separate by line", force "Remove line breaks" off.
-            if bool(sbl) and bool(nlb):
-                nlb = False
+            # If "Separate by line" is turned on, clear the line-break replacement.
+            if bool(sbl) and nlb:
+                nlb = ""
             s = _persist_global_settings(lang, temp, ap, nlb, sbl, _current)
-            return s, gr.update(value=bool(nlb))
+            return s, gr.update(value=nlb)
 
         global_nlb.change(
             fn=_persist_from_nlb,
@@ -1461,26 +1510,28 @@ Mia: Is this your sneaky way of saying you want to study together, Lucas?""",
             outputs=[vd_status, vd_preset_dd],
         )
 
-        # Generate
+        # Generate — history_df is intentionally NOT in any outputs list so that
+        # Gradio's loading overlay never blocks the table during generation.
+        # history_state.change() below keeps the table in sync instead.
         cv_btn.click(
             fn=generate_custom,
             inputs=[cv_preset_dd, cv_speaker, cv_emotion, cv_speed, cv_text, global_lang, global_temp, global_ap, global_nlb, global_sbl, history_state],
-            outputs=[cv_audio, cv_status, history_state, history_df],
+            outputs=[cv_audio, cv_status, history_state, _hist_sink],
         )
         vd_btn.click(
             fn=generate_design,
             inputs=[vd_preset_dd, vd_description, vd_text, global_lang, global_temp, global_ap, global_nlb, global_sbl, history_state],
-            outputs=[vd_audio, vd_status, history_state, history_df],
+            outputs=[vd_audio, vd_status, history_state, _hist_sink],
         )
         sv_btn.click(
             fn=generate_clone_saved,
             inputs=[sv_dropdown, sv_text, global_lang, global_temp, global_ap, global_nlb, global_sbl, history_state],
-            outputs=[sv_audio, sv_status, history_state, history_df],
+            outputs=[sv_audio, sv_status, history_state, _hist_sink],
         )
         qc_btn.click(
             fn=generate_clone_quick,
             inputs=[qc_audio_in, qc_ref_text, qc_text, global_lang, global_temp, global_ap, global_nlb, global_sbl, history_state],
-            outputs=[qc_audio_out, qc_status, history_state, history_df],
+            outputs=[qc_audio_out, qc_status, history_state, _hist_sink],
         )
         qc_save_btn.click(
             fn=save_quick_clone_voice,
@@ -1513,7 +1564,15 @@ Mia: Is this your sneaky way of saying you want to study together, Lucas?""",
         dialogue_btn.click(
             fn=generate_multi_character_dialogue,
             inputs=[dialogue_text, global_lang, global_temp, global_ap, global_nlb, history_state],
-            outputs=[dialogue_audio, dialogue_status, history_state, history_df],
+            outputs=[dialogue_audio, dialogue_status, history_state, _hist_sink],
+        )
+
+        # Keep the history table in sync without attaching it to any running
+        # function — this fires after each state update with no loading overlay.
+        history_state.change(
+            fn=_history_to_df,
+            inputs=[history_state],
+            outputs=[history_df],
         )
 
         history_df.select(
